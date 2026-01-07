@@ -19,32 +19,68 @@ class SlotCaptionDataset(Dataset):
     def __init__(self, index_json: str, root_dir: str, split: str):
         self.root_dir = Path(root_dir)
         self.index_path = Path(index_json)
-        self.records: List[Dict[str, Any]] = []
+        # self.records: List[Dict[str, Any]] = []
+        groups: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
+        # groups = {
+        #     (0, 0): [rec1, rec2, rec3, ...],
+        #     (0, 1): [rec9, rec10, ...],
+        #     (0, 2): [rec17, ...],
+        # }
 
         with open(self.index_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
-                self.records.append(json.loads(line))
-        n_train = int(len(self.records) * 0.8)
+                rec = json.load(line)
+                key = (int(rec["video_idx"]), int(rec["frame_idx"]))
+                groups.setdefault(key,[]).append(rec)
+                # self.records.append(json.loads(line))
+
+        self.frame_keys = sorted(groups.keys())
+
+        n_train = int(len(self.frame_keys)*0.8)
+
+        # n_train = int(len(self.records) * 0.8)
         if split == "train":
-            self.records = self.records[:n_train]
+            self.frame_keys = self.frame_keys[:n_train]
+            # self.records = self.records[:n_train]
             # print(f"Loading training data from {self.index_path}")
         elif split == "val":
-            self.records = self.records[n_train:]
+            self.frame_keys = self.frame_keys[n_train:]
+            # self.records = self.records[n_train:]
             # print(f"Loading validation data from {self.index_path}")
 
+        self.groups = groups
+
+        self.Mmax = 10
+
     def __len__(self) -> int:
-        return len(self.records)
+        return len(self.groups)
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        rec = self.records[idx]
-        slot_feat_path = self.root_dir / rec["slot_feat_path"]
-        caption = rec["caption"]
-    
+        key = self.frame_keys[idx]
+        recs = self.groups[key]
+        # recs = sorted(recs,key=lambda r:int(r.get("instance_idx", 0)))
+        
+        feats: List[torch.Tensor] = []
+        captions: List[str] = []
+
+        for r in recs:
+            p = self.self.root_dir / r["slot_feat_path"]
+            feat = torch.load(p, map_location="cpu").float().view(-1)  # (D,)
+            feats.append(feat)
+            captions.append(r["caption"])
+        slot_dim = feats[0].shape[-1]
+        while len(feats) < self.Mmax:
+            feat.append(torch.zeros(slot_dim))
+
+        slot_feat = torch.stack(feats, dim=0)
+            
         return {
-            "slot_feat": torch.load(slot_feat_path, map_location="cpu").float().view(-1),
-            "caption": caption
+            "video_idx": key[0],
+            "frame_idx": key[1],
+            "slot_feat": slot_feat,
+            "captions": captions,
         }
 
 @torch.no_grad()
