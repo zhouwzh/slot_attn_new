@@ -139,35 +139,96 @@ class SlotTextModel(nn.Module):
             slot_dim:int,
             embed_dim:int =256,
             tau: float =0.1,
+            Mmax: int = 10,
+            # scene_pool: str = "attn" # {"attn","mean","concat"}
         ):
         super().__init__()
         self.text_encoder = textencoder
         self.tau = tau
+        self.Mmax = Mmax
+        # self.scene_pool = scene_pool
 
         self.vision_proj = nn.Linear(slot_dim, embed_dim)
         self.text_proj = nn.Linear(getattr(textencoder, "embed_dim", embed_dim), embed_dim)
+
+        # for concatenate linear pooling
+        self.scene_proj = nn.Linear(Mmax * embed_dim, embed_dim)
+        self.pad_text = nn.Parameter(torch.zeros(embed_dim))
+        # # for attentive pooling over slots (scene-level)
+        # self.scene_attn_q = nn.Parameter(torch.randn(embed_dim))
+        # self.scene_attn_k = nn.Linear(embed_dim, embed_dim, bias=False)
+
+        # # for concat pooling (needs fixed K at runtime; we lazy-init on first use)
+        # self._scene_concat_proj = None  # nn.Linear(K*D, D)
 
     @staticmethod
     def _l2norm(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
         return x / (x.norm(dim=-1, keepdim=True) + eps)
     
+    def compute_attribute_loss(
+        self,
+        slot_feat: torch.Tensor, #(B,Mmax,D_slot)
+        captions: List[List[str]],
+    ) -> torch.Tensor:
+        B,M,D = slot_feat.shape
+
+        z = self._l2norm(self.vision_proj(slot_feat))
+        caps_flat = [c for caps_b in captions for c in caps_b] # (B*M,)
+        t = self.text_encoder(caps_flat)
+        t = self._l2norm(self.text_proj(t)).view(B,M,-1)
+
+        sim = (z * t).sum(dim=-1)
+        loss = ((1.0 - sim).pow(2)).mean()
+        return loss
+    
+    def compute_scene_loss(
+        self,
+        slot_feat: torch.Tensor, #(B,Mmax,D_slot)
+        captions: List[List[str]], #(B,m,)
+        pool:str = "concat" #['concat','attentive']
+    )-> torch.Tensor:
+        B,M,D = slot_feat.shape
+
+        z_slots = self._l2norm(self.vision_proj(slot_feat))
+
+        if pool == "concat":
+            z = z_slots.reshape(B,M*z_slots.shape(-1))
+            z_scene = self._l2norm(self.scene_proj(z))
+        else:
+            raise ValueError(pool)
+        
+        scene_caps = [" and ".join(caps_b) for caps_b in captions]
+        t_scene = self.text_encoder(scene_caps)
+        t_scene = self._l2norm(self.text_proj(t_scene))
+
+        sim = (z_scene * t_scene).sum(dim=-1) #(B,)
+        loss = (1.0 - sim).pow(2).mean()
+        return loss
+
+
     def forward(self, slot_feat, captions):
-        B = slot_feat.size(0)
+        attribute_loss = self.compute_attribute_loss(slot_feat, captions)
+        scene_loss = self.compute_scene_loss(slot_feat, captions, pool = "concat")
+        loss = attribute_loss + scene_loss
 
-        z = self.vision_proj(slot_feat)  # (B, D)
-        z = self._l2norm(z)
+        return attribute_loss, scene_loss, loss
 
-        t = self.text_encoder(captions)  # (B, D)
-        t = self._l2norm(t)
+        # B = slot_feat.size(0)
 
-        logits = (z @ t.t()) / self.tau           # (B, B)
-        targets = torch.arange(B, device=logits.device)
+        # z = self.vision_proj(slot_feat)  # (B, D)
+        # z = self._l2norm(z)
 
-        loss_i2t = F.cross_entropy(logits, targets)
-        loss_t2i = F.cross_entropy(logits.t(), targets)
-        loss = 0.5 * (loss_i2t + loss_t2i)
+        # t = self.text_encoder(captions)  # (B, D)
+        # t = self._l2norm(t)
 
-        return loss, z, t
+        # logits = (z @ t.t()) / self.tau           # (B, B)
+        # targets = torch.arange(B, device=logits.device)
+
+        # loss_i2t = F.cross_entropy(logits, targets)
+        # loss_t2i = F.cross_entropy(logits.t(), targets)
+        # loss = 0.5 * (loss_i2t + loss_t2i)
+
+        # return loss, z, t
 
         
         
