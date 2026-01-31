@@ -3,7 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import spacy
 import json
+from typing import List
 
+from torch.nn.utils.rnn import pack_padded_sequence
+import timm
 
 def contrastive_loss(z_emb: torch.Tensor,
                             l_emb: torch.Tensor,
@@ -36,71 +39,6 @@ class LockedDropout(nn.Module):
             return x
         return x.new_empty(x.shape[:dim] + (1,) + x.shape[dim+1:]).bernoulli_(1 - dropout) / (1 - dropout) * x
 
-# class TextEncoder(nn.Module):
-#     """
-#         极简版文本编码器：
-#         - 输入：token ids (B, L) 和长度 x_len (B,)
-#         - 做 embedding 后，对非 PAD 的位置做平均池化
-#         - 输出：
-#             ret    : (B, D) 句子级 embedding（给对比学习用）
-#             output : (B, L, D) 每个 token 的 embedding（如果你想做别的用）
-#             attns  : None（这里不做视觉 attention）
-#     """
-#     def __init__(self, vocab, embedding_dim=512, pad_token_id=0, dropout=0.0):
-#         super().__init__()
-#         self.vocab = vocab               # word -> id 字典
-#         self.idx2word = {i: w for w, i in vocab.items()}
-#         self.vocab_size = len(vocab)
-
-#         self.embedding_dim = embedding_dim
-#         self.pad_token_id = pad_token_id
-
-#         self.embedding = nn.Embedding(
-#             num_embeddings=self.vocab_size,
-#             embedding_dim=self.embedding_dim,
-#             padding_idx=self.pad_token_id,
-#         )
-
-#         self.dropout_o = dropout
-#         self.dropout = LockedDropout()
-#         self.output_dropout = nn.Dropout(self.dropout_o)
-
-#         self.hidden_dim = self.embedding_dim
-
-#         self.text_encoder = "embedding"
-#         self.embedding_type = None
-
-#     def forward(self, x, x_len, image_features=None, image_feature_map=None):
-#         """
-#         x      : LongTensor (B, L)  句子 token ids（已对齐、pad 好）
-#         x_len  : LongTensor (B,)    每句真实长度（不含 pad）
-#         返回:
-#             ret    : (B, D) 句向量（平均池化）
-#             output : (B, L, D) 每个 token 的 embedding
-#             attns  : None
-#         """
-#         # (B, L, D)
-#         attns = None
-#         embedding = self.embedding(x)
-        
-#         if self.text_encoder == "embedding":
-#             raw_output = embedding
-#             if self.embedding_type == "flat":
-#                 ret = torch.sum(raw_output, dim=1) / x_len.unsqueeze(1)
-        
-#         output = self.lockdrop(raw_output, self.dropout_o)
-
-#         if self.embedding_type == "flat":
-#             ret = self.output_dropout(ret)
-#         elif self.embedding_type == "spatial":
-#             ret = output
-
-#         return ret, output, attns
-
-#     @property
-#     def regressional(self):
-#         # 保留接口，按原代码逻辑：只有 lstm 才是 regressional，这里返回 False 就行
-#         return False
         
 class SimpleConvBackbone(nn.Module):
     """
@@ -160,208 +98,216 @@ class SlotTextModel(nn.Module):
 
         # # for concat pooling (needs fixed K at runtime; we lazy-init on first use)
         # self._scene_concat_proj = None  # nn.Linear(K*D, D)
+        
+        self.scene_pma_q = nn.Parameter(torch.randn(1, 1, embed_dim))
+        
+        ############################ Early fusion ##############################
+        self.max_text_len = 50
+        self.ef_cls = nn.Parameter(torch.randn(1, 1, embed_dim))      # CLS token
+        self.ef_type_emb = nn.Embedding(3, embed_dim)                 # 0:vision, 1:text, 2:cls
+        self.ef_pos_emb = nn.Parameter(torch.randn(1, 1 + Mmax + self.max_text_len, embed_dim))
+        
+        ef_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=8,
+            dim_feedforward=4 * embed_dim,
+            dropout=0.1,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        
+        self.ef_xf = nn.TransformerEncoder(ef_layer, num_layers=2)
+        ########################################################################
 
     @staticmethod
     def _l2norm(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
         return x / (x.norm(dim=-1, keepdim=True) + eps)
     
-    def compute_attribute_loss(
-        self,
-        slot_feat: torch.Tensor, #(B,Mmax,D_slot)
-        captions: List[List[str]],
-    ) -> torch.Tensor:
-        B,M,D = slot_feat.shape
-
-        z = self._l2norm(self.vision_proj(slot_feat))
-        caps_flat = [c for caps_b in captions for c in caps_b] # (B*M,)
-        t = self.text_encoder(caps_flat)
-        t = self._l2norm(self.text_proj(t)).view(B,M,-1)
-
-        sim = (z * t).sum(dim=-1)
-        loss = ((1.0 - sim).pow(2)).mean()
-        return loss
-    
-    def compute_scene_loss(
-        self,
-        slot_feat: torch.Tensor, #(B,Mmax,D_slot)
-        captions: List[List[str]], #(B,m,)
-        pool:str = "concat" #['concat','attentive']
-    )-> torch.Tensor:
-        B,M,D = slot_feat.shape
-
-        z_slots = self._l2norm(self.vision_proj(slot_feat))
-
-        if pool == "concat":
-            z = z_slots.reshape(B,M*z_slots.shape(-1))
-            z_scene = self._l2norm(self.scene_proj(z))
-        else:
-            raise ValueError(pool)
+    def infonce_loss(self, z, t):
+        B = z.shape[0]
+        tau = getattr(self, "tau", 0.07)
+        logits = (z @ t.t()) / tau
+        labels = torch.arange(B, device=logits.device)
         
-        scene_caps = [" and ".join(caps_b) for caps_b in captions]
-        t_scene = self.text_encoder(scene_caps)
-        t_scene = self._l2norm(self.text_proj(t_scene))
-
-        sim = (z_scene * t_scene).sum(dim=-1) #(B,)
-        loss = (1.0 - sim).pow(2).mean()
-        return loss
-
-
-    def forward(self, slot_feat, captions):
-        attribute_loss = self.compute_attribute_loss(slot_feat, captions)
-        scene_loss = self.compute_scene_loss(slot_feat, captions, pool = "concat")
+        loss_i2t = F.cross_entropy(logits, labels)
+        loss_t2i = F.cross_entropy(logits.t(), labels)
+        loss = 0.5 * (loss_i2t + loss_t2i)
+        
+        loss_batch = F.cross_entropy(logits, labels, reduction="none")
+        return loss_batch
+    
+    def attentive_pooling(self, z_slots):
+        q = z_slots.mean(dim=1, keepdim=True)                 # (B,1,D)
+        attn = (z_slots * q).sum(dim=-1)                      # (B,M)
+        alpha = F.softmax(attn, dim=1).unsqueeze(-1)          # (B,M,1)
+        z_scene = (z_slots * alpha).sum(dim=1)                # (B,D)
+        return z_scene
+    
+    def PMA(self,z_slots):  #learnable pooling by multihead attention
+        B = z_slots.shape[0]
+        q = self.scene_pma_q.expand(B, -1, -1)                       # (B,1,D)
+        scores = torch.matmul(q, z_slots.transpose(1, 2))            # (B,1,M)
+        scores = scores / (z_slots.shape[-1] ** 0.5)
+        alpha = F.softmax(scores, dim=-1)                            # (B,1,M)
+        z_scene = torch.matmul(alpha, z_slots).squeeze(1)            # (B,D)
+        return z_scene
+    
+    def early_fuse(self, z_slots, tok_ids, tok_lens):
+        """
+        z_slots: (B,M,D)   after vision_proj + l2norm
+        tok_ids: (B,1,L)
+        tok_lens:(B,1)
+        return:  z_fuse (B,D)  # CLS pooling
+        """
+        B, M, D = z_slots.shape
+        L = tok_ids.shape[-1]
+        device = z_slots.device
+        
+        t_words = self.text_encoder.embedding(tok_ids.squeeze(1)) #B,1,L -> B,L,D
+        
+        # ---- build multimodal token sequence: [CLS, V(=slots), T(=words)] ----
+        cls = self.ef_cls.expand(B, 1, D)                            # (B,1,D)
+        x = torch.cat([cls, z_slots, t_words], dim=1)                # (B, 1+M+L, D)
+        
+        # ---- type embedding ----
+        type_ids = torch.cat([
+            torch.full((B, 1), 2, device=device, dtype=torch.long),  # CLS
+            torch.full((B, M), 0, device=device, dtype=torch.long),  # vision
+            torch.full((B, L), 1, device=device, dtype=torch.long),  # text
+        ], dim=1) 
+        
+        x = x + self.ef_type_emb(type_ids)                          # (B, 1+M+L, D)
+        x = x + self.ef_pos_emb[:, : (1 + M + L), :].to(device)     # (B, 1+M+L, D)
+        
+        # key padding mask: mask text pads only
+        text_len = tok_lens.squeeze(1).to(device)                   # (B,)
+        text_pos = torch.arange(L, device=device).unsqueeze(0)      # (1,25)
+        text_mask = text_pos >= text_len.unsqueeze(1)               # (B,25)
+    
+        key_padding_mask = torch.cat([
+            torch.zeros((B,1+M), device=device, dtype=torch.bool),
+            text_mask
+        ], dim=1)                                                   # (B,1+M+25)
+    
+        y = self.ef_xf(x, src_key_padding_mask=key_padding_mask)    # (B,1+M+25,D)
+        z_fuse = self._l2norm(y[:, 0])                              # CLS pooling -> (B,D)
+        return z_fuse
+        
+    def forward(self, slot_feat, tok_ids, tok_lens):
+        """
+        slot_feat: (B,M,Dslot)
+        tok_ids:   (B,M,L) / (B,1,L)
+        tok_lens:  (B,M)   / (B,1) 
+        """
+        B, M, _ = slot_feat.shape
+        z_slots = self._l2norm(self.vision_proj(slot_feat))   # B M D
+        
+        # text encode once
+        if tok_ids.shape[1] != 1:
+            tok_ids_flat = tok_ids.view(B*M, -1).to(slot_feat.device)
+            tok_lens_flat = tok_lens.view(B*M).to(slot_feat.device)
+            t_flat = self.text_encoder.forward_ids(tok_ids_flat, tok_lens_flat)  # (B*M,Dtxt)
+            t_slots = self._l2norm(self.text_proj(t_flat)).view(B, M, -1) 
+            
+            # scene loss
+            valid = (tok_lens > 1).float().unsqueeze(-1)       # (B,M,1)
+            
+            z_scene = (z_slots * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)  # (B,D)
+            z_scene = self._l2norm(z_scene)
+            t_scene = (t_slots * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)  # (B,D)
+            t_scene = self._l2norm(t_scene)
+        else:
+            tok_ids_flat = tok_ids.view(B*1, -1).to(slot_feat.device)
+            tok_lens_flat = tok_lens.view(B*1).to(slot_feat.device)
+            t_slots = self.text_encoder.forward_ids(tok_ids_flat,tok_lens_flat)  #B,Dtxt
+            t_slots = self._l2norm(self.text_proj(t_slots)) #B,256
+            
+            t_scene = t_slots
+            z_scene = z_slots.sum(dim=1)
+            #z_scene = self.attentive_pooling(z_slots)
+            #z_scene = self.PMA(z_slots)
+            #z_scene = self.early_fuse(z_slots, tok_ids, tok_lens)
+            
+        # attribute loss
+        #sim_attr = (z_slots * t_slots).sum(dim=-1)
+        #attribute_loss = ((1.0 - sim_attr).pow(2)).mean()
+        #attribute_loss = torch.tensor(0).to(slot_feat.device)
+        
+        ##################################
+        # Huber
+        #sim_scene = (z_scene * t_scene).sum(dim=-1)       # (B,)
+        #scene_loss = (1.0 - sim_scene).pow(2).mean()
+        
+        scene_loss = self.infonce_loss(z_scene, t_scene)
+        scene_loss = scene_loss.mean()
+        
+        attribute_loss = torch.zeros_like(scene_loss).to(scene_loss.device)
+        
         loss = attribute_loss + scene_loss
 
         return attribute_loss, scene_loss, loss
-
-        # B = slot_feat.size(0)
-
-        # z = self.vision_proj(slot_feat)  # (B, D)
-        # z = self._l2norm(z)
-
-        # t = self.text_encoder(captions)  # (B, D)
-        # t = self._l2norm(t)
-
-        # logits = (z @ t.t()) / self.tau           # (B, B)
-        # targets = torch.arange(B, device=logits.device)
-
-        # loss_i2t = F.cross_entropy(logits, targets)
-        # loss_t2i = F.cross_entropy(logits.t(), targets)
-        # loss = 0.5 * (loss_i2t + loss_t2i)
-
-        # return loss, z, t
-
         
+    def evaluate(self, slot_feat, tok_ids, tok_lens):
+        """
+        slot_feat: (B,M,Dslot)
+        tok_ids:   (B,M,L)
+        tok_lens:  (B,M)
+        output:
+        attribute_loss: 4
+        scene_loss: 4
+        loss: 4
+        """
+        #import pdb; pdb.set_trace()
+        B, M, _ = slot_feat.shape
+        z_slots = self._l2norm(self.vision_proj(slot_feat))
         
-    
-# class MultimodalModel(nn.Module):
-#     """
-#     intput:
-#       images:   List[Tensor(B,3,H,W)]
-#       masks:    List[Tensor(B,K_i,H,W)]
-#       captions: List[List[str]]
-
-#     输出：
-#       loss_cc:  InfoNCE
-#       z_all:    (N, D) vision embedding
-#       l_all:    (N, D) text embedding
-#     """
-#     def __init__(self,
-#                  vision_backbone: nn.Module = None,
-#                  text_encoder: nn.Module = None,
-#                  embed_dim: int = 256,
-#                  tau: float = 0.1):
-#         super().__init__()
-#         self.nlp = spacy.load("en_core_web_sm")
-#         with open("/home/wz3008/slot-attn/vocab.json") as f:
-#             self.vocab = json.load(f)
-
-        
-#         if not vision_backbone:
-#             self.vision_backbone = SimpleConvBackbone(feature_dim=embed_dim)
-#         else:
-#             self.vision_backbone = vision_backbone
-
-#         self.tau = tau
-    
-#         self.text_encoder = text_encoder
-
-#         self.vision_proj = nn.Sequential(
-#             nn.Linear(embed_dim, embed_dim),
-#             nn.ReLU(inplace=True),
-#             nn.Linear(embed_dim, embed_dim),
-#         )
-#         self.text_proj = nn.Sequential(
-#             nn.Linear(embed_dim, embed_dim),
-#             nn.ReLU(inplace=True),
-#             nn.Linear(embed_dim, embed_dim),
-#         )
-
-#     def tokenize(self, captions):
-#         """
-#         captions: List[str]
-#         token_ids: List[List[int]], len=N, each is the list of caption's token id
-#         """
-#         max_seq_len = 25
-
-#         if isinstance(captions, str):
-#             captions = [captions]
-        
-#         all_tokens = []
-#         token_lengths = []
-
-#         for cap in captions:
-#             doc = self.nlp(cap)
-#             word_tokens = [token.text for token in doc]
-
-#             if len(word_tokens) > max_seq_len - 2:
-#                 word_tokens = word_tokens[:max_seq_len - 2]
+        # text encode once
+        if tok_ids.shape[1] != 1:
+            tok_ids_flat = tok_ids.view(B*M, -1).to(slot_feat.device)
+            tok_lens_flat = tok_lens.view(B*M).to(slot_feat.device)
+            t_flat = self.text_encoder.forward_ids(tok_ids_flat, tok_lens_flat)  # (B*M,Dtxt)
+            t_slots = self._l2norm(self.text_proj(t_flat)).view(B, M, -1) 
             
-#             token_lenght = len(word_tokens) + 2
+            # scene loss
+            valid = (tok_lens > 1).float().unsqueeze(-1)       # (B,M,1)
+            
+            z_scene = (z_slots * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)  # (B,D)
+            z_scene = self._l2norm(z_scene)
+            t_scene = (t_slots * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)  # (B,D)
+            t_scene = self._l2norm(t_scene)
+        else:
+            tok_ids_flat = tok_ids.view(B*1, -1).to(slot_feat.device)
+            tok_lens_flat = tok_lens.view(B*1).to(slot_feat.device)
+            t_slots = self.text_encoder.forward_ids(tok_ids_flat,tok_lens_flat)  #B,Dtxt
+            t_slots = self._l2norm(self.text_proj(t_slots)) 
+            
+            t_scene = t_slots
+            z_scene = z_slots.sum(dim=1)
+            #z_scene = self.attentive_pooling(z_slots)
+            #z_scene = self.PMA(z_slots)
+            #z_scene = self.early_fuse(z_slots, tok_ids, tok_lens)
+        
+        # attribute loss
+        # sim_attr = (z_slots * t_slots).sum(dim=-1)  # 4,10
+        # attribute_loss = ((1.0 - sim_attr).pow(2)).mean(1)  # 4,10
+        #attribute_loss = torch.zeros(4,10).to(slot_feat.device)
+        
+        ##############################
+        # Huber
+        #sim_scene = (z_scene * t_scene).sum(dim=-1)       # (B,)
+        #scene_loss = (1.0 - sim_scene).pow(2)   
+        
+        scene_loss = self.infonce_loss(z_scene, t_scene)
+        
+        attribute_loss = torch.zeros_like(scene_loss).to(scene_loss.device)
+        
+        loss = attribute_loss + scene_loss
 
-#             tokens = [self.vocab["<sos>"]] + [self.vocab.get(token, self.vocab["<unk>"]) for token in word_tokens] + [self.vocab["<eos>"]] + [self.vocab["<pad>"]] * (max_seq_len - len(word_tokens) - 2)
-#             all_tokens.append(tokens)
-#             token_lengths.append(token_lenght)
-#         return tokens, token_lengths
-
-#     def forward(self, images, masks, captions):
-#         """
-#         images:   List[Tensor(3,H,W)]
-#         gt_masks: List[Tensor(K_i,H,W)]
-#         captions: List[List[str]]
-#         """
-#         device = next(self.parameters()).device
-
-#         if isinstance(images, list):
-#             imgs = torch.stack([img.to(device) for img in images], dim=0)  # (B,3,H,W)
-#         B = imgs.shape[0]
-
-#         feats = self.vision_backbone(imgs)   # (B, C, h, w)
-#         B, C, h, w = feats.shape
-
-#         # 3. 用 mask 对 feature map 做加权平均，得到每个 object 的视觉向量
-#         all_slot_feats = []   # List[Tensor(K_i, C)]
-#         all_captions_flat = []  # List[str]，和 slot 对齐
-
-#         for b in range(B):
-#             feat_b = feats[b]                   # (C, h, w)
-#             mask_b = masks[b].to(device)        # (K_i, H, W)
-#             K_i, H, W = mask_b.shape
-
-#             # 将 mask resize 到 feature map 的空间大小 (h, w)
-#             mask_resized = F.interpolate(
-#                 mask_b.unsqueeze(1).float(),    # (K_i,1,H,W)
-#                 size=(h, w),
-#                 mode="nearest"
-#             ).squeeze(1)                         # (K_i,h,w)
-
-#             # 展平空间维度
-#             feat_flat = feat_b.view(C, -1)      # (C, h*w)
-#             mask_flat = mask_resized.view(K_i, -1)  # (K_i, h*w)
-
-#             # 防止除 0
-#             eps = 1e-6
-#             weights = mask_flat / (mask_flat.sum(dim=1, keepdim=True) + eps)  # (K_i, h*w)
-#             # (K_i, C) = (K_i,h*w) @ (h*w,C)
-#             slot_feats = weights @ feat_flat.t()      # (K_i, C)
-
-#             all_slot_feats.append(slot_feats)
-#             all_captions_flat.extend(captions[b])     # 将这帧的 K_i 个 caption 接到总 list 里
-
-#         # 拼成 (N, C)
-#         z_vis = torch.cat(all_slot_feats, dim=0)   # (N, C)
-
-#         # 4. 文本编码：把所有 object caption 拼成一个大 list，一次性编码
-#         l_txt = self.text_encoder(all_captions_flat)  # (N, D)
-
-#         # 5. 投影到公共空间
-#         z_emb = self.vision_proj(z_vis)  # (N, D)
-#         l_emb = self.text_proj(l_txt)    # (N, D)
-
-#         # 6. CTRL-O 风格 InfoNCE 对比损失
-#         loss_cc = contrastive_loss(z_emb, l_emb, tau=self.tau)
-
-#         return loss_cc, z_emb, l_emb
-
+        return attribute_loss, scene_loss, loss
+        
+    
+        
 class TextEncoder(nn.Module):
     """
     - Python hash: token to [0, vocab_size)
@@ -382,8 +328,29 @@ class TextEncoder(nn.Module):
         self.embedding = nn.Embedding(vocab_size, embed_dim)
         self.gru = nn.GRU(embed_dim, embed_dim, batch_first=True)
         self.nlp = spacy.load("en_core_web_sm")
-        with open("/home/wz3008/slot-attn/vocab.json") as f:
+        with open("/scratch/wz3008/new_SlotAttn/slot_attn_new/vocab.json") as f:
             self.vocab = json.load(f)
+            
+        self.pad_id = 1
+    
+    #def embedding(self, token_ids):
+    #    """
+    #    token_ids: (B,L) long
+    #    return:    (B,L,D) float
+    #    """
+    #    return self.embedding(token_ids)
+    
+    def forward_ids(self, token_ids: torch.Tensor, lengths: torch.Tensor)-> torch.Tensor:
+        """
+        token_ids: (N, L)  long
+        lengths:   (N,)    long
+        return: sent_emb (N, D)
+        """
+        lengths = lengths.clamp(min=1).cpu()
+        emb = self.embedding(token_ids)  # (N,L,D)
+        packed = pack_padded_sequence(emb, lengths, batch_first=True, enforce_sorted=False)
+        _, h_n = self.gru(packed)        # (1,N,D)
+        return h_n.squeeze(0)            # (N,D)
 
     def tokenize(self, captions):
         """
@@ -393,7 +360,6 @@ class TextEncoder(nn.Module):
         max_seq_len = 25
         all_tokens = []
         token_lengths = []
-        # import pdb; pdb.set_trace()
         # if isinstance(captions, str):
         #     captions = [captions]
 
@@ -435,3 +401,133 @@ class TextEncoder(nn.Module):
         out, h_n = self.gru(emb)      # h_n: (1, N, D)
         sent_emb = h_n.squeeze(0)     # (N, D)
         return sent_emb
+        
+class VitTextModel(nn.Module):
+    """
+    input: slot_feat (B,D_slot), caption tokens (B,L)
+    output: loss + embeddings
+    """
+    def __init__(
+            self, 
+            args,
+            textencoder: nn.Module,
+            embed_dim:int =256,
+            tau: float =0.1,
+            Mmax: int = 10,
+            vit_name: str = "vit_base_patch16_224",  # ViT-B/14
+            # scene_pool: str = "attn" # {"attn","mean","concat"}
+        ):
+        super().__init__()
+        self.text_encoder = textencoder
+        self.tau = tau
+        self.Mmax = Mmax
+
+        self.vit = timm.create_model(vit_name, pretrained=False, num_classes=0)
+        vit_dim = getattr(self.vit, "num_features", None) or getattr(self.vit, "embed_dim", None)
+        if args.vit_checkpoint:
+            ckpt_path = args.vit_checkpoint 
+            ckpt = torch.load(ckpt_path, map_location="cpu") 
+            state = ckpt["student"] 
+            self.vit.load_state_dict(state, strict=False) 
+        vit_dim = getattr(self.vit, "num_features", None) or getattr(self.vit, "embed_dim", None)
+        self.vision_proj = nn.Linear(vit_dim, embed_dim)
+        
+        self.text_proj = nn.Linear(getattr(textencoder, "embed_dim", embed_dim), embed_dim)
+        
+        self.mask_pooling = args.mask_pool
+
+    @staticmethod
+    def _l2norm(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        return x / (x.norm(dim=-1, keepdim=True) + eps)
+    
+    def forward(self, images: torch.Tensor, tok_ids: torch.Tensor, tok_lens: torch.Tensor, masks: torch.Tensor):
+        """
+        images:  (B,3,H,W)
+        tok_ids: (B,M,L)
+        tok_lens:(B,M)
+        masks: B 1 H W
+        return: scalar loss
+        """
+        if not self.mask_pool:
+            z_img = self._l2norm(self.vision_proj(self.vit(images))) #(B,D)
+        else:
+            tok = self.vit.forward_features(images) #B,197,768
+            tok = tok[:,1:,:]
+            B,N,C = tok.shape
+            S = int(N ** 0.5)
+            feat_map = tok.transporse(1,2).reshape(B,C,S,S)
+            masks_f = F.interpolate(
+                masks.float().view(B*masks.shape[1], 1, masks.shape[-2], masks.shape[-1]),
+                size = (S, S),
+                mode = "nearest"
+            ).view(B, masks.shape[1], 1, S, S) #B M 1 S S
+            masks_f = masks_f.flatten(3) # (B,M,1,196)
+            feat_map_flat = feat_map.flatten(2).unsqueeze(1) # (B,1,768,196)
+            pooled = (masks_f * feat_map_flat).sum(dim=-1) / masks_f.sum(dim=-1).clamp_min(1e-6) #B,M,768
+            pooled_mean = pooled.mean(dim=1)
+            z_img = self._l2norm(self.vision_proj(pooled))
+        
+        B,M,_ = tok_ids.shape
+        tok_ids_flat = tok_ids.view(B*M, -1)
+        tok_lens_flat = tok_lens.view(B*M)
+        t_flat = self.text_encoder.forward_ids(tok_ids_flat, tok_lens_flat)  # (B*M,Dtxt)
+        t_slots = self._l2norm(self.text_proj(t_flat)).view(B, M, -1) 
+
+        valid = (tok_lens > 1).float().unsqueeze(-1)       # (B,M,1)
+        t_scene = (t_slots * valid).sum(dim=1) / (valid.sum(dim=1).clamp(min=1.0))  # (B,D)
+        t_scene = self._l2norm(t_scene) # (B,D)
+
+        # sim = (z_img * t_scene).sum(dim=-1)
+        #loss_b = (1.0 - sim).pow(2)                         # (B,)
+        #loss = loss_b.mean()
+        tau = getattr(self, "tau", 0.07)
+        logits = (z_img @ t_scene.t()) / tau
+        labels = torch.arange(B, device=logits.device)
+        
+        loss_i2t = F.cross_entropy(logits, labels)
+        loss_t2i = F.cross_entropy(logits.t(), labels)
+        loss = 0.5 * (loss_i2t + loss_t2i)
+        
+        loss_b = F.cross_entropy(logits, labels, reduction="none")
+        return loss, loss_b
+    
+    def evaluate(self, images: torch.Tensor, tok_ids: torch.Tensor, tok_lens: torch.Tensor, masks: torch.Tensor):
+        """
+        images:  (B,3,H,W)
+        tok_ids: (B,M,L)
+        tok_lens:(B,M)
+        masks: B 1 H W
+        return: scalar loss
+        """
+        if not self.mask_pool:
+            z_img = self._l2norm(self.vision_proj(self.vit(images))) #(B,D)
+        else:
+            tok = self.vit.forward_features(images) #B,197,768
+            tok = tok[:,1:,:]
+            B,N,C = tok.shape
+            S = int(N ** 0.5)
+            feat_map = tok.transporse(1,2).reshape(B,C,S,S)
+            masks_f = F.interpolate(
+                masks.float().view(B*masks.shape[1], 1, masks.shape[-2], masks.shape[-1]),
+                size = (S, S),
+                mode = "nearest"
+            ).view(B, masks.shape[1], 1, S, S) #B M 1 S S
+            masks_f = masks_f.flatten(3) # (B,M,1,196)
+            feat_map_flat = feat_map.flatten(2).unsqueeze(1) # (B,1,768,196)
+            pooled = (masks_f * feat_map_flat).sum(dim=-1) / masks_f.sum(dim=-1).clamp_min(1e-6) #B,M,768
+            pooled_mean = pooled.mean(dim=1)
+            z_img = self._l2norm(self.vision_proj(pooled))
+        
+        B,M,_ = tok_ids.shape
+        tok_ids_flat = tok_ids.view(B*M, -1)
+        tok_lens_flat = tok_lens.view(B*M)
+        t_flat = self.text_encoder.forward_ids(tok_ids_flat, tok_lens_flat)  # (B*M,Dtxt)
+        t_slots = self._l2norm(self.text_proj(t_flat)).view(B, M, -1) 
+
+        valid = (tok_lens > 1).float().unsqueeze(-1)       # (B,M,1)
+        t_scene = (t_slots * valid).sum(dim=1) / (valid.sum(dim=1).clamp(min=1.0))  # (B,D)
+        t_scene = self._l2norm(t_scene) # (B,D)
+
+        sim = (z_img * t_scene).sum(dim=-1)
+        loss_b = (1.0 - sim).pow(2)                         # (B,)
+        return loss_b
